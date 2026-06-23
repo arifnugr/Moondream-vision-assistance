@@ -1,9 +1,7 @@
 import os
 import cv2
 import time
-import threading
 from datetime import datetime
-import queue
 import Jetson.GPIO as GPIO
 
 from ollama_moondream import (
@@ -34,10 +32,6 @@ trigger_requested = False
 is_processing = False
 cap = None
 
-# Queue untuk frame terbaru (ukuran 1 = selalu overwrite dengan frame terbaru)
-frame_queue = queue.Queue(maxsize=1)
-camera_thread_running = False
-
 
 def open_camera():
     cap = cv2.VideoCapture(CAMERA_INDEX)
@@ -47,40 +41,6 @@ def open_camera():
     if not cap.isOpened():
         raise RuntimeError("Tidak bisa membuka kamera. Cek USB/driver.")
     return cap
-
-
-def camera_reader_thread():
-    """Thread yang terus membaca frame dari kamera untuk menjaga buffer tetap fresh"""
-    global camera_thread_running, frame_queue
-    
-    print("[THREAD] Camera reader thread dimulai...")
-    camera_thread_running = True
-    
-    try:
-        while camera_thread_running:
-            ok, frame = cap.read()
-            if ok:
-                # Selalu gunakan frame terbaru (overwrite frame lama)
-                try:
-                    frame_queue.put_nowait(frame)
-                except queue.Full:
-                    # Queue penuh, buang frame lama dan masukkan yang baru
-                    try:
-                        frame_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                    frame_queue.put_nowait(frame)
-            else:
-                print("[ERR] Gagal membaca frame dari camera reader thread")
-                break
-            
-            time.sleep(0.01)  # Kecil delay untuk tidak overload
-    
-    except Exception as e:
-        print(f"[ERR] Camera reader thread error: {e}")
-    finally:
-        camera_thread_running = False
-        print("[THREAD] Camera reader thread berhenti")
 
 
 def save_frame(frame):
@@ -107,19 +67,22 @@ def save_outputs(base_name, en_text, id_text, latency):
 
 
 def run_pipeline():
-    """Pipeline lengkap dengan frame dari background thread reader"""
-    global frame_queue
+    
+    global cap
     
     print("\n================= PIPELINE DIMULAI =================")
     wall_start = time.time()
     latency = {}
     
-    # Ambil frame terbaru dari queue
-    try:
-        frame = frame_queue.get(timeout=2.0)
-        print("[1/5] Frame terbaru diambil dari buffer")
-    except queue.Empty:
-        print("[ERR] Timeout menunggu frame dari kamera.")
+    # Flush camera buffer - baca dan buang frame lama untuk mendapatkan frame terbaru
+    print("[BUFFER] Membersihkan buffer kamera untuk frame terbaru...")
+    for _ in range(5):  # Baca 5 frame terakhir untuk memastikan buffer kosong
+        cap.read()
+    
+    # Capture frame terbaru
+    ok, frame = cap.read()
+    if not ok:
+        print("[ERR] Gagal membaca frame kamera.")
         return
     
     img_path = save_frame(frame)
@@ -200,7 +163,7 @@ def button_callback(channel):
 
 
 def main():
-    global trigger_requested, is_processing, cap, camera_thread_running
+    global trigger_requested, is_processing, cap
     
     # Setup GPIO
     GPIO.setmode(GPIO.BOARD)
@@ -209,15 +172,8 @@ def main():
     
     # Buka kamera
     cap = open_camera()
-    
-    # Mulai background camera reader thread
-    reader_thread = threading.Thread(target=camera_reader_thread, daemon=True)
-    reader_thread.start()
-    time.sleep(0.5)  # Tunggu thread mulai membaca frame
-    
-    print("=== Vision Assist — Advanced Frame Reader Mode ===")
+    print("=== Vision Assist — Button Trigger Mode ===")
     print(f"Tombol pada pin fisik {BUTTON_PIN}. Tekan untuk proses.")
-    print("[INFO] Background camera reader thread aktif untuk frame fresh")
     print("Tekan Ctrl+C untuk keluar.\n")
     
     try:
@@ -239,8 +195,6 @@ def main():
     except KeyboardInterrupt:
         print("\n[MAIN] Dihentikan. Keluar...")
     finally:
-        camera_thread_running = False
-        reader_thread.join(timeout=2.0)
         if cap:
             cap.release()
         GPIO.cleanup()
